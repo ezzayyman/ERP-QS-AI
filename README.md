@@ -1,84 +1,177 @@
 # GMI FloorTakeoff
 
-Legend-aware flooring quantity takeoff and BOQ for GMI Design and Implementation LLC (Dubai).
+Drawing takeoff and BOQ tool for GMI Design and Implementation LLC (Dubai).
 
-The application reads a floor-finish drawing as a structured document. It interprets the drawing's own
-finishes legend, finds where each finish occurs on the plan, traces the finish boundaries from the drawing
-geometry, and calibrates from the drawing's figured dimensions. The results are offered for review; only
-reviewed and accepted measurements become BOQ quantities, each traceable to its source region, legend entry
-and sheet.
+FloorTakeoff reads fit-out drawings (PDF, image or DXF) as structured documents rather than pictures. It
+interprets each sheet's own legend, finds where every finish or symbol occurs, measures it from the drawing
+geometry, and calibrates from the figured dimensions. It then builds a priced bill of quantities.
 
-- Why the previous version placed and measured regions wrongly: [`docs/DIAGNOSIS.md`](docs/DIAGNOSIS.md)
-- Results on the Boutique Kitchen reference drawing: [`docs/VALIDATION_REPORT.md`](docs/VALIDATION_REPORT.md)
+Nothing reaches the BOQ on its own. Every quantity is offered for review, traces back to its source region,
+legend entry and sheet, and the BOQ is approved by a person.
+
+> **Status:** an assistant to the estimator, not a stand-alone estimator. It takes off what the drawings show
+> and flags what it can't measure (missing schedules, unrated items, sheets it doesn't recognise). Results are
+> compared with real QS BOQs in [`docs/validation/`](docs/validation/).
+
+## What it reads
+
+| Trade | From | Billed |
+|---|---|---|
+| Floor finishes | Finish legend, coloured or hatched fills, code tags | m², with derived screed, levelling and waterproofing |
+| Skirting, thresholds, trims | Linear legend entries, door positions | m |
+| Wall finishes | Plan-note leaders, finish tags, finish lines | m² by wall height, or m for linear items |
+| Ceilings | RCP grid and pattern, shadow gaps | m² / m |
+| Doors | Swing arcs | nr, priced by leaf type |
+| Joinery | Item schedules | nr, priced from past item medians |
+| Lighting | Symbols matched to the legend images | nr per fitting type, plus light points |
+| Electrical | "Key to electrical symbols": sockets, twin sockets, isolators, switches | nr |
+| Kitchen equipment | Equipment schedules | Listed as by others; grease traps go to plumbing |
+| MEP, signage, preliminaries | Allowances per m² from past projects of the same type | Lump sum per section |
+
+Exports: Excel, CSV and PDF, plus a QS-format workbook matching GMI's BOQ layout. The QS-format workbook can also
+be compared line by line with an uploaded QS BOQ.
+
+## Screenshots
+
+**Floor finishes.** The sheet's own finish legend is read, each finish is traced on the plan, and the title
+block and legend are excluded from measurement.
+
+![Takeoff review of a flooring layout, with finish areas traced over the drawing and the legend entries listed for checking](docs/screenshots/floor-takeoff.png)
+
+**Wall finishes and partitions.** Wall runs are assigned to their partition and cladding types from the
+plan notes and finish tags.
+
+![Partition layout with measured wall runs highlighted over the drawing](docs/screenshots/wall-finishes.png)
+
+**Ceilings and lighting.** Ceiling types are measured from the RCP, and light fittings are counted against
+the sheet's lighting legend.
+
+![RCP layout with ceiling areas shaded and counted light fittings marked](docs/screenshots/ceilings-and-lighting.png)
+
+**Bill of quantities.** Every open issue is listed before approval, with totals by trade.
+
+![BOQ page showing the draft status, open warnings and project totals](docs/screenshots/boq-summary.png)
+
+**BOQ lines.** Each line shows where its rate came from (matched, estimated or missing), whether it still needs
+checking, and how its quantity was measured.
+
+![BOQ lines for partitions, wall finishes and ceilings, each tagged with its rate source and check status](docs/screenshots/boq-lines.png)
 
 ## Stack
 
-React 19 + TypeScript + Vite (frontend), FastAPI + SQLAlchemy/SQLite (backend), PyMuPDF (PDF vectors and
-rendering), Shapely (geometry), OpenCV/NumPy (hatch coverage, raster fallback), openpyxl / ReportLab (exports).
-No external AI service is used. Classification and geometry are deterministic and testable.
+- **Frontend:** React 19, TypeScript, Vite, Tailwind.
+- **Backend:** FastAPI, SQLAlchemy with SQLite.
+- **Drawings and geometry:** PyMuPDF for PDF vectors and rendering, Shapely for geometry, OpenCV and NumPy for hatches and raster sheets, ezdxf for DXF.
+- **Exports:** openpyxl and ReportLab.
+- **OCR:** Tesseract (optional), for scanned legends.
 
-## Pipeline
+No external AI service is used. Classification and geometry are deterministic and covered by tests.
 
-| Stage | Module | What it does |
-|---|---|---|
-| Import | `document_import.py`, `routes/drawings.py` | Renders pages for display. Records each page's canonical coordinate space. Queues background analysis (`jobs.py`). |
-| Vector extraction | `vector_extract.py` | Fills intersected with their active clip paths (even-odd / non-zero), kept in paint order. Strokes as arrays. Text spans and blocks. Images. All in rotated display space (PDF points). Cached per file hash. |
-| Legend | `legend.py`, `legend_rows.py`, `ocr.py` | Finds the legend heading and parses it in one of two ways. **Tables** with a column-header row (code / image / symbol / description) are parsed by columns and rules. **Header-less legends** (title, category sub-headings, CODE · description · swatch rows, partial or no rules) are parsed by code-column alignment, row bands, same-line and continuation text, category headings, and swatches associated by row geometry (never by colour). Image-based legends are read with Tesseract OCR (results always marked for review); if OCR is missing the stage reports why. Each row yields code, description, category, indicator kind (area / linear / raster / text-only), swatch box and colour, and a symbol signature. Tag-notation keys are reported, not added. Every stage reports its own status. |
-| Calibration | `calibration_engine.py` | Figured dimensions measured tick-to-tick (not along overshooting dimension lines). Mode-seeking consensus, comparison with the stated scale, explicit notes. A user must confirm the calibration. |
-| Detection | `finish_detection.py` | Legend fill colours matched with CIEDE2000. Paint-order visibility where only finish fills (and dark structure) occlude; annotations and furniture never remove floor. Composite symbols (e.g. a border band) are resolved by ray enclosure. Same-colour finishes are separated by hatch signature. Hatch-only finishes are traced by hatch coverage, with edges refined to the line ends. Linear finishes come from their line style, with dash gaps bridged. Code labels corroborate or conflict. Scope comes from phrase rules (e.g. "BY OTHERS"). |
-| Raster fallback | `raster_detection.py` | For scanned or flattened sheets: local-mean CIELAB matching against legend swatches or user-picked plan samples. Ambiguous pixels are left unassigned. Never rated above "medium". |
-| Review | `takeoff_service.py`, `routes/takeoff.py` | Candidates are stored apart from measurements. A candidate is accepted only with a resolved finish and scope, and never on top of accepted area (overlap → 409, or clip). Supports edit, split, merge, fill openings and reclassify, with server-side undo/redo and an audit trail. |
-| Quantities | `quantities.py`, `boq_export.py` | Accepted regions only, recomputed from geometry and the active calibration. Grouped by code + unit + scope. Waste, packages and rates come from the legend entry or a linked catalogue item, with saved adjustments surviving regeneration. A signature check marks an approved BOQ "needs review" when measurements change. Excel/CSV/PDF/ERP exports include a region register. |
-| Validation | `validation_report.py`, `backend/tools/validate_reference_drawing.py` | Compares with *independent* reference quantities (e.g. PlanSwift). States plainly when none exist. |
+## Getting started
 
-### Coordinates
-
-All geometry is stored in a page's canonical space:
-- `pdf_pt`: PDF points, rotated display space.
-- `image_px`: original raster pixels.
-- `render_px`: legacy pages created before this pipeline.
-
-The page image is drawn stretched to exactly `source_width × source_height`, so render resolution and device
-pixel ratio cannot shift geometry. The single view transform lives in `src/utils/viewTransform.ts`.
-Calibration is stored as units per metre in the same space.
-
-Legacy pages can be converted explicitly ("Convert to PDF coordinates" in the review panel). Their geometry and
-calibration are rescaled by the exact render ratio, so areas do not change.
-
-### Review workflow (UI: Takeoff review panel)
-
-- **A · Legend:** correct codes and descriptions, set default scope, then confirm or reject entries.
-- **B–E · Candidates:** each candidate shows its evidence, boundary quality and conflicts. Choose the finish and scope, then accept or reject. Bulk accept applies only to classified candidates and still enforces every check.
-- **Scale:** review the figured-dimension evidence and confirm, or calibrate manually.
-- **F · Approval:** approve the BOQ from accepted measurements. This is blocked while calibrations are unconfirmed or scopes unresolved.
-
-## Run
+Requirements: Python 3.12 and Node.js 20 or later. Tesseract is optional.
 
 ```bash
 py -3.12 -m pip install -r requirements.txt
 ```
 
 ```bash
+npm install
+```
+
+Start the backend (http://localhost:8000, API docs at `/docs`):
+
+```bash
 py -3.12 run_local_backend.py
 ```
 
-```bash
-npm install
-```
+Start the frontend (http://localhost:5173):
 
 ```bash
 npm run dev
 ```
 
-Backend on http://localhost:8000 (docs at `/docs`), frontend on http://localhost:5173. `GMI_STORAGE_DIR`
-selects another storage root (database, drawings, renders). The Vite proxy target can be overridden with
-`GMI_API_TARGET`.
+On Windows, `start_gmi_floortakeoff.bat` starts both servers.
 
-### Database migrations
+The backend reloads when its code changes. It works on the database in `backend/storage/`, so point
+`GMI_STORAGE_DIR` at a copy when experimenting (see [Configuration](#configuration)).
 
-On start-up `migrations.py` applies pending, numbered migrations, recorded in `schema_migrations`. Before applying
-them it copies the SQLite file to `backend/storage/backups/`. Migrations only add columns and tables; existing
-geometry is preserved, and legacy regions are marked `source = legacy_*`.
+## Using it
+
+1. **Create a project** and upload its drawings: single PDFs, a multi-page set or a ZIP. Each sheet is analysed in the background, and uploading the same file twice is refused.
+2. **Takeoff review**, for each sheet:
+   - **Legend:** check the codes, descriptions and default scope that were read.
+   - **Scale:** confirm the calibration proposed from figured dimensions, or calibrate manually.
+   - **Regions:** accept, reject, edit, split or merge detected regions. Undo and redo are kept on the server.
+   - **Approve:** approve the BOQ from accepted measurements.
+3. **BOQ:** set rates, project type and allowances, compare with a QS BOQ, and export.
+
+Approval is blocked while anything is open: sheets still being read, duplicate sheets, unconfirmed scales,
+unreviewed regions, unchecked lines, unmeasured legend entries or unclassified scope. An estimator can still
+**approve anyway** by giving a reason. The BOQ and every export then say "Approved with override", with the
+reason and what was open. Two cases can't be overridden: sheets still being read and duplicate sheets, because
+the quantities would be incomplete or doubled.
+
+When measurements change after approval, the BOQ goes back to "Needs review".
+
+## Configuration
+
+All settings are environment variables; none are required for local use.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GMI_STORAGE_DIR` | `backend/storage` | Root for the database, drawings, renders, exports and backups |
+| `DATABASE_URL` | SQLite file in the storage dir | SQLAlchemy URL |
+| `GMI_AUTH_SECRET` | unset (open) | Enables sign-in through GMI ERP; it must match the ERP's `TAKEOFF_SHARED_SECRET`. It can also be set in `erp-link.env` |
+| `GMI_WORKERS` | half the CPUs, 1–3 | Background analysis workers |
+| `GMI_SYNC_JOBS` | `0` | `1` runs analysis inline (tests, scripts) |
+| `GMI_SKIP_SEED` | `0` | `1` skips the sample data on start-up |
+| `GMI_TESSERACT_CMD` | auto-detected | Path to `tesseract.exe` |
+| `GMI_API_TARGET` | `http://127.0.0.1:8000` | Backend that the Vite dev server proxies to |
+
+### ERP sign-in
+
+With `GMI_AUTH_SECRET` set, every API call and stored file needs a token from GMI ERP. The token is an HS256
+JWT with audience `gmi-takeoff`. Users open the tool from the ERP's Estimation screen. Without a secret the
+tool runs open, which is meant for local development and tests only.
+
+### Data safety
+
+- **Before migrations:** start-up applies pending migrations from `migrations.py`, copying the SQLite file to `backups/` first.
+- **Daily snapshot:** a snapshot is taken at start-up each day.
+- **Deletes:** each delete snapshots the database first and moves files to `storage/trash` instead of erasing them.
+- **Clear all:** clearing a project requires typing its name.
+
+## Project layout
+
+```
+backend/
+  app/
+    main.py               FastAPI app, workers, start-up
+    routes/               API: projects, drawings, takeoff, BOQ, exports, PlanSwift
+    vector_extract.py     PDF fills, strokes and text in display space
+    legend.py             legend detection and parsing (tables, header-less, OCR)
+    calibration_engine.py scale from figured dimensions
+    finish_detection.py   floor finishes from fills, hatches and tags
+    wall_finishes.py      wall finishes from plan notes
+    wall_tags.py          finish tags assigned to wall faces
+    ceiling_detection.py  RCP ceilings
+    doors.py              doors from swing arcs
+    symbol_count.py       lighting symbols
+    electrical.py         electrical symbol key
+    joinery.py            joinery item schedules
+    kitchen_equipment.py  kitchen equipment schedules
+    quantities.py         BOQ generation, checks and approval gate
+    allowances.py         allowance sections per m²
+    qs_format.py          QS-format export and comparison
+    data/                 rate libraries (JSON)
+  tools/                  rate-library builders and validation scripts
+  tests/                  backend tests (isolated storage)
+src/                      React frontend
+tests/frontend/           frontend tests
+docs/                     rate libraries (xlsx), diagnosis and validation reports
+  screenshots/            images used in this README
+```
 
 ## Tests
 
@@ -90,19 +183,48 @@ npm run test:backend
 npm run test:frontend
 ```
 
-Backend tests run against a temporary database and storage directory, never the live data:
-- Synthetic PDFs with analytically known answers (clip paths, even-odd holes, composite symbols, same-colour finishes, hatch-only finishes, dashed lines, dimension ticks, /Rotate 0/90/270, legends in different corners, missing descriptions, duplicate codes, raster symbols).
-- Render-alignment checks.
-- The end-to-end API workflow.
-- Fixture points on the Boutique Kitchen drawing.
+Type-check the frontend with:
 
-The frontend test checks zoom, pan, resize and DPR invariance of the view transform.
+```bash
+npx tsc --noEmit -p tsconfig.app.json
+```
+
+Use `-p tsconfig.app.json`, because `-p .` checks nothing.
+
+Backend tests always run against a temporary database and storage folder, never the live data. They use synthetic PDFs
+with known answers: clip paths, holes, composite symbols, hatches, dashed lines, rotation, and legends in
+different layouts. A few tests also use a reference drawing from local storage and are skipped when it isn't
+present.
+
+## Rate libraries
+
+Rates come from GMI's past BOQs and contractor quotations. They are built by the scripts in `backend/tools/`:
+
+| Library | Built by | Used from |
+|---|---|---|
+| Wall, ceiling and trim | `build_trade_rate_library.py` | the catalogue, loaded with `import_rate_library.py` |
+| Joinery | `build_joinery_rates.py` | `backend/app/data/joinery_rates.json` |
+| MEP | `build_mep_rates.py` | `backend/app/data/mep_rates.json` |
+| Allowances | `build_allowance_rates.py` | `backend/app/data/allowance_rates.json` |
+
+Each library also has a readable workbook in `docs/`. `import_rate_library.py` only adds new items to the
+catalogue, unless `--update-existing` is passed.
+
+> **Confidential.** Rate libraries, cost data and project drawings are GMI commercial information. Keep this
+> repository private, and don't commit `backend/storage/`, `.env` or `erp-link.env`.
 
 ## Known limitations
 
-- **No independent reference yet.** Quantities on the reference drawing have not been compared with an independent PlanSwift takeoff (see the validation report).
-- **Hatch-only finishes have approximate boundaries.** Those without a vector outline (e.g. TL-03, LL on the reference sheet) follow hatch-line ends, so concave corners narrower than the closing radius must be checked in review.
-- **Labels are matched by position only.** Leader lines are not traced; tags away from their region are listed as unmatched.
-- **Scanned legends rely on Tesseract.** Image-based legends need Tesseract (found on PATH, in `C:\Program Files\Tesseract-OCR`, or via `GMI_TESSERACT_CMD`) plus `pytesseract`. OCR text is always marked for review: letter/digit confusions in codes such as FIC-01A for FTC-01A, or 018 for 01B, cannot be corrected automatically. Photographic swatches are recorded but not used to classify vector plans.
-- **DWG is not read directly.** Export to PDF (preferred, keeps vectors) or DXF.
-- **Two older surfaces are not on the new pipeline.** The original contour room detector (`cv_engine.py`) remains as a boundary-only assist, and the standalone `gmi_floortakeoff_app.py` is a separate legacy file that has not been migrated.
+- **Drawings it can't read yet:**
+  - plumbing, HVAC, fire and gas layouts;
+  - kitchen layout sheets without a schedule;
+  - lighting sheets without a legend.
+  These are listed as not used for the takeoff.
+- **Missing joinery:** joinery is priced only when the drawings include an item schedule.
+- **Hatch-only finishes have approximate edges.** Narrow concave corners need checking in review.
+- **Scanned legends rely on Tesseract.** OCR text is always marked for review.
+- **DWG is not read directly.** Export it to PDF (preferred, keeps vectors) or DXF.
+- **Legacy code:** `gmi_floortakeoff_app.py` and the contour detector in `cv_engine.py` are older code, not part of the current pipeline.
+
+More detail: [`docs/DIAGNOSIS.md`](docs/DIAGNOSIS.md), [`docs/VALIDATION_REPORT.md`](docs/VALIDATION_REPORT.md),
+[`docs/validation/`](docs/validation/).
